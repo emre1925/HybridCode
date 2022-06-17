@@ -72,171 +72,104 @@ class Power_reallocate(torch.nn.Module):
     
     
 
-# BP Decoding algorithm (Switch from TF to Pytorch ==> In progress)
+# BP-SP Decoding algorithm
 
-def compute_vc(cv, iteration, soft_input):
-    weighted_soft_input = soft_input
+def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
+    _llr_max = 500
+    B, N, L = llr_vec.size()
+    out_llrs = llr_vec.clone()
+    out_word = torch.signbit(llr_vec)
+    n_c = ldpc_code_params['n_cnodes']
+    n_v = ldpc_code_params['n_vnodes']
+    recover_indices = torch.arange(0, n_c*N, n_c).to(llr_vec.device)
 
-    edges = []
-    for i in range(0, n):
-        for j in range(0, var_degrees[i]):
-            edges.append(i)
-    reordered_soft_input = tf.gather(weighted_soft_input, edges)
+    llr_vec = llr_vec.clamp(-_llr_max, _llr_max)  # clip LLRs
+    llr_vec = llr_vec.repeat_interleave(n_c, dim=1)
 
-    vc = []
-    edge_order = []
-    for i in range(0, n): # for each variable node v
-        for j in range(0, var_degrees[i]):
-            # edge = d[i][j]
-            edge_order.append(d[i][j])
-            extrinsic_edges = []
-            for jj in range(0, var_degrees[i]):
-                if jj != j: # extrinsic information only
-                    extrinsic_edges.append(d[i][jj])
-            # if the list of edges is not empty, add them up
-            if extrinsic_edges:
-                temp = tf.gather(cv,extrinsic_edges)
-                temp = tf.reduce_sum(temp,0)
-                #print(temp.shape)
+    # Initialization
+    dec_word = torch.signbit(llr_vec)
+    msg_llrs = llr_vec.clone()
 
-                #temp = temp * tf.tile(tf.reshape(decoder.W_check[iteration,i],[-1,1]),[1,batch_size])
+    parity_check_matrix = H.to(torch.float).unsqueeze(0).repeat_interleave(B, dim=0)
+    parity_check_matrix = parity_check_matrix.repeat(1, N, 1).to_sparse()
 
-            else:
-                temp = tf.zeros([batch_size])
-            if SUM_PRODUCT: temp = tf.cast(temp, tf.float32)#tf.cast(temp, tf.float64)
-            vc.append(temp)
+    message_matrix = sparse_dense_mul(parity_check_matrix, llr_vec)
 
+    for iter_cnt in range(n_iters):
+        iterations = iter_cnt + 1
+        term_check = sparse_dense_mul(parity_check_matrix, dec_word)
+        term_check = torch.sparse.sum(term_check, dim=2)
+        term_check = term_check.to_dense().view(B, N, n_c) % 2
+        term_check = torch.chunk(term_check, chunks=B, dim=0)
 
-    vc = tf.stack(vc)
-    new_order = np.zeros(num_edges).astype(np.int)
-    new_order[edge_order] = np.array(range(0,num_edges)).astype(np.int)
-    vc = tf.gather(vc,new_order)
+        curr_llr = torch.index_select(msg_llrs, 1, recover_indices)
+        curr_word = torch.index_select(dec_word, 1, recover_indices)
+        nan_mask = torch.isnan(curr_llr)
+        out_llrs[~nan_mask] = curr_llr[~nan_mask]
+        out_word[~nan_mask] = curr_word[~nan_mask]
 
-    if W_vc_indicator:
-        W_vc = tf.tile(tf.reshape(decoder.W_vc,[-1,1]),[1,batch_size])
-        vc = (W_vc * vc) + reordered_soft_input
-    else:
-        vc = vc + reordered_soft_input
+        if decoder_algorithm == 'SPA':
+            message_matrix *= .5
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     torch.tanh(message_matrix._values()),
+                                                     message_matrix.size())
 
-    return vc, cv
+            log2_msg_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                      torch.log2(message_matrix._values().to(torch.complex128)),
+                                                      message_matrix.size())
 
-# compute messages from check nodes to variable nodes
-def compute_cv(vc, cv, iteration):
-    cv_list = []
-    prod_list = []
-    min_list = []
-    cv_tmp = cv[:]
+            msg_products_real = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
+                                                        log2_msg_matrix._values().real,
+                                                        log2_msg_matrix.size())
+            msg_products_real = torch.sparse.sum(msg_products_real, dim=2)
+            msg_products_imag = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
+                                                        log2_msg_matrix._values().imag,
+                                                        log2_msg_matrix.size())
+            msg_products_imag = torch.sparse.sum(msg_products_imag, dim=2)
+            msg_products = torch.sparse_coo_tensor(msg_products_real._indices(),
+                                                   torch.view_as_complex(
+                                                       torch.stack((msg_products_real._values(),
+                                                                    msg_products_imag._values()),
+                                                                   dim=1)),
+                                                   msg_products_real.size())
+            msg_products = torch.sparse_coo_tensor(msg_products._indices(),
+                                                   (2 ** msg_products._values()).real,
+                                                   msg_products.size())
 
-    if SUM_PRODUCT:
-        vc = tf.clip_by_value(vc, -10, 10)
-        tanh_vc = tf.tanh(vc / 2.0)
-    edge_order = []
-    for i in range(0, m): # for each check node c
-        for j in range(0, chk_degrees[i]):
-            # edge = u[i][j]
-            edge_order.append(u[i][j])
-            extrinsic_edges = []
-            for jj in range(0, chk_degrees[i]):
-                if jj != j:
-                    #print(jj)
-                    extrinsic_edges.append(u[i][jj])
-            if SUM_PRODUCT:
-                temp = tf.gather(tanh_vc,extrinsic_edges)
-                temp = tf.reduce_prod(temp,0)
-                temp = tf.log((1+temp)/(1-temp))
-                cv_list.append(temp)
-            if MIN_SUM:
-                temp = tf.gather(vc,extrinsic_edges)
-                temp1 = tf.reduce_prod(tf.sign(temp),0)
-                temp2 = tf.reduce_min(tf.abs(temp),0)
-                prod_list.append(temp1)
-                min_list.append(temp2)
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     (1 / message_matrix._values()),
+                                                     message_matrix.size())
 
+            message_matrix = sparse_dense_mul(message_matrix,
+                                              msg_products.to_dense().unsqueeze(2).repeat_interleave(n_v, dim=2))
 
-    if SUM_PRODUCT:
-        cv = tf.stack(cv_list)
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     message_matrix._values().clamp(-1, 1),
+                                                     message_matrix.size())
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     torch.arctan(message_matrix._values()),
+                                                     message_matrix.size())
 
-    if MIN_SUM:
-        prods = tf.stack(prod_list)
-        mins = tf.stack(min_list)
-        if decoder.decoder_type == "RNOMS":
-            # offsets = tf.nn.softplus(decoder.B_cv)
-            # mins = tf.nn.relu(mins - tf.tile(tf.reshape(offsets,[-1,1]),[1,batch_size]))
-            mins = tf.nn.relu(mins - decoder.B_cv)
-        elif decoder.decoder_type == "FNOMS":
-            offsets = tf.nn.softplus(decoder.B_cv[iteration])
-            mins = tf.nn.relu(mins - tf.tile(tf.reshape(offsets,[-1,1]),[1,batch_size]))
-        cv = prods * mins
-
-    new_order = np.zeros(num_edges).astype(np.int)
-    new_order[edge_order] = np.array(range(0,num_edges)).astype(np.int)
-    cv = tf.gather(cv,new_order)
-
-    if W_cv_indicator:
-        if decoder.decoder_type == "RNSPA" or decoder.decoder_type == "RNNMS":
-            W_cv = tf.tile(tf.reshape(decoder.W_cv,[-1,1]),[1,batch_size])
-            cv = cv * W_cv
-        elif decoder.decoder_type == "FNSPA" or decoder.decoder_type == "FNNMS":
-            W_cv = tf.tile(tf.reshape(decoder.W_cv[iteration],[-1,1]),[1,batch_size])
-            cv = cv * W_cv
-        elif decoder.decoder_type == "RNN-SS":
-            W_cv = tf.tile(tf.reshape(decoder.W_cv,[-1,1]),[num_edges,batch_size])
-            if SNR_adaptation:
-                predictions_cv = PAN(decoder.snr, decoder.weights_CV, decoder.biases_CV)
-                cv = cv * W_cv * predictions_cv
-            else:
-                cv = cv * W_cv       
-    return cv
-
-# combine messages to get posterior LLRs
-def marginalize(soft_input, iteration, cv):
-    weighted_soft_input = soft_input
-
-    soft_output = []
-    for i in range(0,n):
-        edges = []
-        for e in range(0,var_degrees[i]):
-            edges.append(d[i][e])
-
-        temp = tf.gather(cv,edges)
-        temp = tf.reduce_sum(temp,0)
-        soft_output.append(temp)
-
-    soft_output = tf.stack(soft_output)
-
-    soft_output = weighted_soft_input + soft_output
-    return soft_output
-
-
-def belief_propagation_iteration(soft_input, soft_output, iteration, cv, m_t, loss, labels, syndrome_wt, indicator, soft_term):
-        
-    # compute vc
-    vc, cv = compute_vc(cv,iteration,soft_input)
-
-    # filter vc
-    if decoder.relaxed:
-        if SNR_adaptation:
-            predictions_relaxation = PAN(decoder.snr, decoder.weights_Relaxation, decoder.biases_Relaxation)
-            m_t = (R * predictions_relaxation *m_t) + ((1-(R * predictions_relaxation)) * vc)
+            message_matrix *= 2
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     message_matrix._values().clamp(-_llr_max, _llr_max),
+                                                     message_matrix.size())
         else:
-            m_t = R * m_t + (1-R) * vc
-        vc_prime = m_t
-    else:
-        vc_prime = vc
+            raise NotImplementedError('Only SPA is implemented for now')
 
-    # compute cv
-    cv = compute_cv(vc_prime, cv, iteration)
+        msg_sum = message_matrix.to_dense()
+        msg_sum = msg_sum.view(B, N, -1, n_v)
+        msg_sum = msg_sum.sum(2)
+        msg_sum = msg_sum.repeat_interleave(n_c, dim=1)
 
-    # get output for this iteration
-    soft_output = marginalize(soft_input, iteration, cv)
-   
-    # L = 0.5
-    print("L = " + str(L))
-    CE_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=-soft_output, labels=labels)) / num_iterations
-    loss = loss + CE_loss
+        message_matrix *= -1
+        message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                 (message_matrix._values()
+                                                  + sparse_dense_mul(parity_check_matrix, (msg_sum + llr_vec))._values()),
+                                                 message_matrix.size())
 
-    iteration += 1
+        msg_llrs = (msg_sum + llr_vec).to(torch.float)
+        dec_word = torch.signbit(msg_llrs)
 
-    return soft_input, soft_output, iteration, cv, m_t, loss, labels, syndrome_wt, indicator, soft_term
-
+    return out_word.to(torch.float), out_llrs.to(torch.float32), iterations
 
