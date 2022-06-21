@@ -13,7 +13,8 @@ import numpy as np
 
 ##################### Author @Emre Ozfatura #####################################
 
-
+#### Import code headers ###
+header_fileName = "Headers/BCH_63_45.alist"
 
 
 #####################Neurol Encoder-Decoder no feedback
