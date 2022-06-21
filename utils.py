@@ -177,8 +177,8 @@ def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
 
 
 class LDPC:
-    def __init__(self, rate, decode_iters, device):
-        self.ldpc_design = self.load_code_from_alist(rate)
+    def __init__(self, header_fn, decode_iters, device):
+        self.ldpc_design = self.load_code_from_alist(header_fn)
         self.G = torch.from_numpy(self.ldpc_design['generator_matrix'].A).to(device).transpose(1, 0)
         self.H = torch.from_numpy(self.ldpc_design['parity_check_matrix'].A).to(device)
         self.k = self.G.shape[0]
