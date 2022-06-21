@@ -4,6 +4,7 @@ import math, pdb
 from torch.autograd import Variable
 import argparse
 import numpy as np
+import commpy.channelcoding.ldpc as ldpc
 
 
 # fixed PE
@@ -172,4 +173,58 @@ def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
         dec_word = torch.signbit(msg_llrs)
 
     return out_word.to(torch.float), out_llrs.to(torch.float32), iterations
+
+
+
+class LDPC:
+    def __init__(self, rate, decode_iters, device):
+        self.ldpc_design = self.load_code_from_alist(rate)
+        self.G = torch.from_numpy(self.ldpc_design['generator_matrix'].A).to(device).transpose(1, 0)
+        self.H = torch.from_numpy(self.ldpc_design['parity_check_matrix'].A).to(device)
+        self.k = self.G.shape[0]
+        self.n = self.H.shape[1]
+        self.decode_algorithm = 'SPA'  # TODO MSA not yet impl
+        self.decode_iters = decode_iters
+        self.device = device
+
+    def load_code_from_alist(self, header_fn):
+        params = ldpc.get_ldpc_code_params(header_fn, compute_matrix=True)
+        params['decode_algorithm'] = 'SPA'
+        return params
+
+    def zero_pad(self, x, modulo):
+        B, _, L = x.size()
+        if torch.numel(x[0]) % modulo != 0:
+            n_pad = (modulo*L) - (torch.numel(x[0]) % (modulo*L))
+            zero_pad = torch.zeros(B, n_pad, device=x.device).view(B, -1, L)
+            padded_message = torch.cat((x, zero_pad), dim=1)
+        else:
+            padded_message = x
+        return padded_message
+
+    def encode(self, message_bits):
+        B, N, L = message_bits.size()
+        padded_message = self.zero_pad(message_bits, self.k)
+        padded_message = padded_message.view(B, -1, self.k)
+        parity = torch.matmul(padded_message, self.G) % 2
+        codeword = torch.cat((padded_message, parity), dim=-1)
+        return codeword
+
+    def decode(self, symbol_llr):
+        # NOTE process batch by batch due to memory use
+        batch_llr = torch.chunk(symbol_llr, chunks=1, dim=0)
+        out_llr = []
+        for b_llr in batch_llr:
+            block_llr = torch.chunk(b_llr, chunks=2, dim=1)
+            d_llr = []
+            for llr_i in block_llr:
+                _, llr, _ = ldpc_bp_decode(llr_i, self.ldpc_design, self.H,
+                                           self.decode_algorithm, self.decode_iters)
+                d_llr.append(llr)
+
+            d_llr = torch.cat(d_llr, dim=1)
+            out_llr.append(d_llr)
+
+        llr = torch.cat(out_llr, dim=0)
+        return llr
 
