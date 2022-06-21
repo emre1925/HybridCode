@@ -218,7 +218,7 @@ class LDPC:
             block_llr = torch.chunk(b_llr, chunks=2, dim=1)
             d_llr = []
             for llr_i in block_llr:
-                _, llr, _ = ldpc_bp_decode(llr_i, self.ldpc_design, self.H,
+                decoded_bits, llr, _ = ldpc_bp_decode(llr_i, self.ldpc_design, self.H,
                                            self.decode_algorithm, self.decode_iters)
                 d_llr.append(llr)
 
@@ -226,5 +226,5 @@ class LDPC:
             out_llr.append(d_llr)
 
         llr = torch.cat(out_llr, dim=0)
-        return llr
+        return decoded_bits, llr
 
