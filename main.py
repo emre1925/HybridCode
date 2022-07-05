@@ -15,7 +15,7 @@ import numpy as np
 
 #### Import code headers ###
 ## TO DO: Include in the main script
-header_fn = "Headers/BCH_63_45.alist"
+header_fn = "Headers/BCH_63_45_3_strip.alist"
 decoding_iterations = 30
 code = LDPC(header_fn, decoding_iterations, args.device)
 # codelength
