@@ -227,4 +227,16 @@ class LDPC:
 
         llr = torch.cat(out_llr, dim=0)
         return decoded_bits, llr
+    
+
+    
+# Function for converting propabilities to LLRs
+# I assume here that the Pr lookup table is a n*2 2D array
+# For each symbol, I assume the first column is the Pr that it's 0, while the 2nd column is the Pr that it's a 1
+# LLR_j = log(Pr(x_j = 1) / Pr(x_j = 0))
+def LLR_convertion(probs, codelength):
+    LLR_vec = torch.zeros(codelength)
+    for i in range(codelength):
+        LLR_vec[i] = torch.log(probs[i,1] / probs[i,0])
+    return LLR_vec
 
