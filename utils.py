@@ -4,6 +4,7 @@ import math, pdb
 from torch.autograd import Variable
 import argparse
 import numpy as np
+import commpy.channelcoding.ldpc as ldpc
 
 
 # fixed PE
@@ -69,3 +70,173 @@ class Power_reallocate(torch.nn.Module):
             inputs1 = inputs1 * self.wt2[seq_order] # sequence_wise scaling
 
         return inputs1
+    
+    
+
+# BP-SP Decoding algorithm
+
+def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
+    _llr_max = 500
+    B, N, L = llr_vec.size()
+    out_llrs = llr_vec.clone()
+    out_word = torch.signbit(llr_vec)
+    n_c = ldpc_code_params['n_cnodes']
+    n_v = ldpc_code_params['n_vnodes']
+    recover_indices = torch.arange(0, n_c*N, n_c).to(llr_vec.device)
+
+    llr_vec = llr_vec.clamp(-_llr_max, _llr_max)  # clip LLRs
+    llr_vec = llr_vec.repeat_interleave(n_c, dim=1)
+
+    # Initialization
+    dec_word = torch.signbit(llr_vec)
+    msg_llrs = llr_vec.clone()
+
+    parity_check_matrix = H.to(torch.float).unsqueeze(0).repeat_interleave(B, dim=0)
+    parity_check_matrix = parity_check_matrix.repeat(1, N, 1).to_sparse()
+
+    message_matrix = sparse_dense_mul(parity_check_matrix, llr_vec)
+
+    for iter_cnt in range(n_iters):
+        iterations = iter_cnt + 1
+        term_check = sparse_dense_mul(parity_check_matrix, dec_word)
+        term_check = torch.sparse.sum(term_check, dim=2)
+        term_check = term_check.to_dense().view(B, N, n_c) % 2
+        term_check = torch.chunk(term_check, chunks=B, dim=0)
+
+        curr_llr = torch.index_select(msg_llrs, 1, recover_indices)
+        curr_word = torch.index_select(dec_word, 1, recover_indices)
+        nan_mask = torch.isnan(curr_llr)
+        out_llrs[~nan_mask] = curr_llr[~nan_mask]
+        out_word[~nan_mask] = curr_word[~nan_mask]
+
+        if decoder_algorithm == 'SPA':
+            message_matrix *= .5
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     torch.tanh(message_matrix._values()),
+                                                     message_matrix.size())
+
+            log2_msg_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                      torch.log2(message_matrix._values().to(torch.complex128)),
+                                                      message_matrix.size())
+
+            msg_products_real = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
+                                                        log2_msg_matrix._values().real,
+                                                        log2_msg_matrix.size())
+            msg_products_real = torch.sparse.sum(msg_products_real, dim=2)
+            msg_products_imag = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
+                                                        log2_msg_matrix._values().imag,
+                                                        log2_msg_matrix.size())
+            msg_products_imag = torch.sparse.sum(msg_products_imag, dim=2)
+            msg_products = torch.sparse_coo_tensor(msg_products_real._indices(),
+                                                   torch.view_as_complex(
+                                                       torch.stack((msg_products_real._values(),
+                                                                    msg_products_imag._values()),
+                                                                   dim=1)),
+                                                   msg_products_real.size())
+            msg_products = torch.sparse_coo_tensor(msg_products._indices(),
+                                                   (2 ** msg_products._values()).real,
+                                                   msg_products.size())
+
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     (1 / message_matrix._values()),
+                                                     message_matrix.size())
+
+            message_matrix = sparse_dense_mul(message_matrix,
+                                              msg_products.to_dense().unsqueeze(2).repeat_interleave(n_v, dim=2))
+
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     message_matrix._values().clamp(-1, 1),
+                                                     message_matrix.size())
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     torch.arctan(message_matrix._values()),
+                                                     message_matrix.size())
+
+            message_matrix *= 2
+            message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                     message_matrix._values().clamp(-_llr_max, _llr_max),
+                                                     message_matrix.size())
+        else:
+            raise NotImplementedError('Only SPA is implemented for now')
+
+        msg_sum = message_matrix.to_dense()
+        msg_sum = msg_sum.view(B, N, -1, n_v)
+        msg_sum = msg_sum.sum(2)
+        msg_sum = msg_sum.repeat_interleave(n_c, dim=1)
+
+        message_matrix *= -1
+        message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
+                                                 (message_matrix._values()
+                                                  + sparse_dense_mul(parity_check_matrix, (msg_sum + llr_vec))._values()),
+                                                 message_matrix.size())
+
+        msg_llrs = (msg_sum + llr_vec).to(torch.float)
+        dec_word = torch.signbit(msg_llrs)
+
+    return out_word.to(torch.float), out_llrs.to(torch.float32), iterations
+
+
+
+class LDPC:
+    def __init__(self, header_fn, decode_iters, device):
+        self.ldpc_design = self.load_code_from_alist(header_fn)
+        self.G = torch.from_numpy(self.ldpc_design['generator_matrix'].A).to(device).transpose(1, 0)
+        self.H = torch.from_numpy(self.ldpc_design['parity_check_matrix'].A).to(device)
+        self.k = self.G.shape[0]
+        self.n = self.H.shape[1]
+        self.decode_algorithm = 'SPA'  # TODO MSA not yet impl
+        self.decode_iters = decode_iters
+        self.device = device
+
+    def load_code_from_alist(self, header_fn):
+        params = ldpc.get_ldpc_code_params(header_fn, compute_matrix=True)
+        params['decode_algorithm'] = 'SPA'
+        return params
+
+    def zero_pad(self, x, modulo):
+        B, _, L = x.size()
+        if torch.numel(x[0]) % modulo != 0:
+            n_pad = (modulo*L) - (torch.numel(x[0]) % (modulo*L))
+            zero_pad = torch.zeros(B, n_pad, device=x.device).view(B, -1, L)
+            padded_message = torch.cat((x, zero_pad), dim=1)
+        else:
+            padded_message = x
+        return padded_message
+
+    def encode(self, message_bits):
+        B, N, L = message_bits.size()
+        padded_message = self.zero_pad(message_bits, self.k)
+        padded_message = padded_message.view(B, -1, self.k)
+        parity = torch.matmul(padded_message, self.G) % 2
+        codeword = torch.cat((padded_message, parity), dim=-1)
+        return codeword
+
+    def decode(self, symbol_llr):
+        # NOTE process batch by batch due to memory use
+        batch_llr = torch.chunk(symbol_llr, chunks=1, dim=0)
+        out_llr = []
+        for b_llr in batch_llr:
+            block_llr = torch.chunk(b_llr, chunks=2, dim=1)
+            d_llr = []
+            for llr_i in block_llr:
+                decoded_bits, llr, _ = ldpc_bp_decode(llr_i, self.ldpc_design, self.H,
+                                           self.decode_algorithm, self.decode_iters)
+                d_llr.append(llr)
+
+            d_llr = torch.cat(d_llr, dim=1)
+            out_llr.append(d_llr)
+
+        llr = torch.cat(out_llr, dim=0)
+        return decoded_bits, llr
+    
+
+    
+# Function for converting propabilities to LLRs
+# I assume here that the Pr lookup table is a n*2 2D array
+# For each symbol, I assume the first column is the Pr that it's 0, while the 2nd column is the Pr that it's a 1
+# LLR_j = log(Pr(x_j = 1) / Pr(x_j = 0))
+def LLR_convertion(probs, codelength):
+    LLR_vec = torch.zeros(codelength)
+    for i in range(codelength):
+        LLR_vec[i] = torch.log(probs[i,1] / probs[i,0])
+    return LLR_vec
+

@@ -13,8 +13,26 @@ import numpy as np
 
 ##################### Author @Emre Ozfatura #####################################
 
+#### Import code headers ###
+## TO DO: Include in the main script
+header_fn = "Headers/BCH_63_45_3_strip.alist"
+decoding_iterations = 30
+code = LDPC(header_fn, decoding_iterations, args.device)
+# codelength
+n = code.n
+# dimension
+k = code.k
+# coderate
+coderate = float(k/n)
 
+# How to encode
+encoded = code.encode(message_bits)
 
+# Convert Probs to LLRs
+LLRs = LLR_convertion(probs, n)
+
+# How to decode (2 outputs, binary decoded and soft output LLRs)
+decoded_bits, soft_outputs = code.decode(LLRs)
 
 #####################Neurol Encoder-Decoder no feedback
 
