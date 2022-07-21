@@ -247,18 +247,20 @@ class LDPC:
         return params
 
     def zero_pad(self, x, modulo):
-        B, _, L = x.size()
-        if torch.numel(x[0]) % modulo != 0:
-            n_pad = (modulo*L) - (torch.numel(x[0]) % (modulo*L))
-            zero_pad = torch.zeros(B, n_pad, device=x.device).view(B, -1, L)
-            padded_message = torch.cat((x, zero_pad), dim=1)
-        else:
-            padded_message = x
-        return padded_message
+        B, L = message_bits.size()
+        padded_message = self.zero_pad(message_bits, self.k)
+        padded_message = padded_message.view(B, self.k)
+        parity = torch.matmul(padded_message, self.G) % 2
+        codeword = torch.cat((padded_message, parity), dim=-1)
+        return codeword
 
     def encode(self, message_bits):
-        codewords = torch.matmul(message_bits, self.G) % 2
-        return codewords
+        B, L = message_bits.size()
+        padded_message = self.zero_pad(message_bits, self.k)
+        padded_message = padded_message.view(B, self.k)
+        parity = torch.matmul(padded_message, self.G) % 2
+        codeword = torch.cat((padded_message, parity), dim=-1)
+        return codeword
 
     def decode(self, symbol_llr):
         # NOTE process batch by batch due to memory use
