@@ -72,6 +72,60 @@ class Power_reallocate(torch.nn.Module):
         return inputs1
     
     
+# Extract the code parameters from the header file   
+def get_ldpc_code_params(ldpc_design_filename, compute_matrix=False):
+    with open(ldpc_design_filename) as ldpc_design_file:
+
+        [n_vnodes, n_cnodes] = [int(x) for x in ldpc_design_file.readline().split(' ')]
+        [max_vnode_deg, max_cnode_deg] = [int(x) for x in ldpc_design_file.readline().split(' ')]
+        vnode_deg_list = np.array([int(x) for x in ldpc_design_file.readline().split(' ')[:-1]], np.int32)
+        cnode_deg_list = np.array([int(x) for x in ldpc_design_file.readline().split(' ')[:-1]], np.int32)
+
+        cnode_adj_list = -np.ones([n_cnodes, max_cnode_deg], int)
+        vnode_adj_list = -np.ones([n_vnodes, max_vnode_deg], int)
+
+        for vnode_idx in range(n_vnodes):
+            vnode_adj_list[vnode_idx, 0:vnode_deg_list[vnode_idx]] = \
+                np.array([int(x)-1 for x in ldpc_design_file.readline().split(' ')])
+
+        for cnode_idx in range(n_cnodes):
+            cnode_adj_list[cnode_idx, 0:cnode_deg_list[cnode_idx]] = \
+                np.array([int(x)-1 for x in ldpc_design_file.readline().split(' ')])
+
+    cnode_vnode_map = -np.ones([n_cnodes, max_cnode_deg], int)
+    vnode_cnode_map = -np.ones([n_vnodes, max_vnode_deg], int)
+
+    for cnode in range(n_cnodes):
+        for i, vnode in enumerate(cnode_adj_list[cnode, 0:cnode_deg_list[cnode]]):
+            cnode_vnode_map[cnode, i] = np.where(vnode_adj_list[vnode, :] == cnode)[0]
+
+    for vnode in range(n_vnodes):
+        for i, cnode in enumerate(vnode_adj_list[vnode, 0:vnode_deg_list[vnode]]):
+            vnode_cnode_map[vnode, i] = np.where(cnode_adj_list[cnode, :] == vnode)[0]
+
+    cnode_adj_list_1d = cnode_adj_list.flatten().astype(np.int32)
+    vnode_adj_list_1d = vnode_adj_list.flatten().astype(np.int32)
+    cnode_vnode_map_1d = cnode_vnode_map.flatten().astype(np.int32)
+    vnode_cnode_map_1d = vnode_cnode_map.flatten().astype(np.int32)
+
+    ldpc_code_params = {}
+
+    ldpc_code_params['n_vnodes'] = n_vnodes
+    ldpc_code_params['n_cnodes'] = n_cnodes
+    ldpc_code_params['max_cnode_deg'] = max_cnode_deg
+    ldpc_code_params['max_vnode_deg'] = max_vnode_deg
+    ldpc_code_params['cnode_adj_list'] = cnode_adj_list_1d
+    ldpc_code_params['cnode_vnode_map'] = cnode_vnode_map_1d
+    ldpc_code_params['vnode_adj_list'] = vnode_adj_list_1d
+    ldpc_code_params['vnode_cnode_map'] = vnode_cnode_map_1d
+    ldpc_code_params['cnode_deg_list'] = cnode_deg_list
+    ldpc_code_params['vnode_deg_list'] = vnode_deg_list
+
+    if compute_matrix:
+        ldpc.build_matrix(ldpc_code_params)
+
+    return ldpc_code_params
+
 
 # BP-SP Decoding algorithm
 
@@ -188,7 +242,7 @@ class LDPC:
         self.device = device
 
     def load_code_from_alist(self, header_fn):
-        params = ldpc.get_ldpc_code_params(header_fn, compute_matrix=True)
+        params = get_ldpc_code_params(header_fn, compute_matrix=True)
         params['decode_algorithm'] = 'SPA'
         return params
 
@@ -203,12 +257,8 @@ class LDPC:
         return padded_message
 
     def encode(self, message_bits):
-        B, N, L = message_bits.size()
-        padded_message = self.zero_pad(message_bits, self.k)
-        padded_message = padded_message.view(B, -1, self.k)
-        parity = torch.matmul(padded_message, self.G) % 2
-        codeword = torch.cat((padded_message, parity), dim=-1)
-        return codeword
+        codewords = torch.matmul(message_bits, self.G) % 2
+        return codewords
 
     def decode(self, symbol_llr):
         # NOTE process batch by batch due to memory use
