@@ -34,6 +34,41 @@ LLRs = LLR_convertion(probs, n)
 # How to decode (2 outputs, binary decoded and soft output LLRs)
 decoded_bits, soft_outputs = code.decode(LLRs)
 
+##------------------------------------------------- End to End Example --------------------------------------------------------------------- 
+# Generate the code
+code = LDPC(args.header_fn, args.decoding_iterations, args.device)
+k = code.k
+n = code.n
+args.blocksize = n
+
+# Info sequence (Note that the second parameter is always 1 (number of sub-blocks))
+u = torch.randint(0, 2, (args.bs, 1, k), device=args.device).to(torch.float)
+
+# Encoding
+x = code.encode(u)
+
+# Modulation
+x_mod = 1 - (2 * x)
+
+# AWGN noise variance (s.t. SNR is given)
+std_forward = np.sqrt(1 / (2 * coderate * 10**(args.snr/10)))
+
+# AWGN
+noise = torch.normal(0, std=std_forward , size=(args.bs, 1, args.blocksize), requires_grad=False) ### for now awgn channel
+noise = torch.tensor(noise, device=args.device)
+
+# Transmission
+x_received = x_mod + noise
+
+# Soft demodulation and normalisation
+Gamma_ch = 2.0 / (std_forward**2)  # LLR calculation for AWGN
+x_received_scaled = Gamma_ch * x_received
+x_received_normalised = x_received_scaled.clamp(-6.07, 6.07)
+
+# Decoding
+decoded_bits, soft_outputs = code.decode(x_received_normalised)
+
+#----------------------------------------------------------------------------------------------------------------------
 #####################Neurol Encoder-Decoder no feedback
 
 ################################## Distributed training approach #######################################################
