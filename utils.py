@@ -72,8 +72,20 @@ class Power_reallocate(torch.nn.Module):
         return inputs1
     
     
-# Extract the code parameters from the header file   
+  
+def sparse_dense_mul(s, d):
+    # TODO make this general for any dims
+    i = s._indices()
+    v = s._values()
+    # get values from relevant entries of dense matrix
+    dv = d[i[0, :], i[1, :], i[2, :]]
+    #dv = d[i[0, :], i[1, :]]
+    return torch.sparse_coo_tensor(i, v * dv, d.size())
+
+
+# Extract the code parameters from the header file 
 def get_ldpc_code_params(ldpc_design_filename, compute_matrix=False):
+
     with open(ldpc_design_filename) as ldpc_design_file:
 
         [n_vnodes, n_cnodes] = [int(x) for x in ldpc_design_file.readline().split(' ')]
@@ -125,24 +137,27 @@ def get_ldpc_code_params(ldpc_design_filename, compute_matrix=False):
         ldpc.build_matrix(ldpc_code_params)
 
     return ldpc_code_params
-
-
+    
+    
 # BP-SP Decoding algorithm
 
 def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
     _llr_max = 500
+    #N = 1
+    #print(f"llr size: {llr_vec.shape}")
     B, N, L = llr_vec.size()
     out_llrs = llr_vec.clone()
-    out_word = torch.signbit(llr_vec)
+    out_word = llr_vec < 0 #torch.signbit(llr_vec)
     n_c = ldpc_code_params['n_cnodes']
     n_v = ldpc_code_params['n_vnodes']
+    #N = 1
     recover_indices = torch.arange(0, n_c*N, n_c).to(llr_vec.device)
 
     llr_vec = llr_vec.clamp(-_llr_max, _llr_max)  # clip LLRs
     llr_vec = llr_vec.repeat_interleave(n_c, dim=1)
 
     # Initialization
-    dec_word = torch.signbit(llr_vec)
+    dec_word = llr_vec < 0 #torch.signbit(llr_vec)
     msg_llrs = llr_vec.clone()
 
     parity_check_matrix = H.to(torch.float).unsqueeze(0).repeat_interleave(B, dim=0)
@@ -170,25 +185,28 @@ def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
                                                      message_matrix.size())
 
             log2_msg_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
-                                                      torch.log2(message_matrix._values().to(torch.complex128)),
+                                                      torch.log2(message_matrix._values()),
                                                       message_matrix.size())
 
             msg_products_real = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
-                                                        log2_msg_matrix._values().real,
+                                                        log2_msg_matrix._values(),
                                                         log2_msg_matrix.size())
             msg_products_real = torch.sparse.sum(msg_products_real, dim=2)
-            msg_products_imag = torch.sparse_coo_tensor(log2_msg_matrix._indices(),
-                                                        log2_msg_matrix._values().imag,
-                                                        log2_msg_matrix.size())
-            msg_products_imag = torch.sparse.sum(msg_products_imag, dim=2)
-            msg_products = torch.sparse_coo_tensor(msg_products_real._indices(),
+            
+            msg_products = msg_products_real
+            
+            #msg_products_imag = torch.sparse_coo_tensor(log2_msg_matrix._indices(), log2_msg_matrix._values().imag, log2_msg_matrix.size())
+            
+            #msg_products_imag = torch.sparse.sum(msg_products_imag, dim=2)
+            
+            '''msg_products = torch.sparse_coo_tensor(msg_products_real._indices(),
                                                    torch.view_as_complex(
                                                        torch.stack((msg_products_real._values(),
                                                                     msg_products_imag._values()),
                                                                    dim=1)),
-                                                   msg_products_real.size())
+                                                   msg_products_real.size())'''
             msg_products = torch.sparse_coo_tensor(msg_products._indices(),
-                                                   (2 ** msg_products._values()).real,
+                                                   (2 ** msg_products._values()),
                                                    msg_products.size())
 
             message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
@@ -202,7 +220,7 @@ def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
                                                      message_matrix._values().clamp(-1, 1),
                                                      message_matrix.size())
             message_matrix = torch.sparse_coo_tensor(message_matrix._indices(),
-                                                     torch.arctan(message_matrix._values()),
+                                                     torch.atan(message_matrix._values()),      # or arctan
                                                      message_matrix.size())
 
             message_matrix *= 2
@@ -224,7 +242,7 @@ def ldpc_bp_decode(llr_vec, ldpc_code_params, H, decoder_algorithm, n_iters):
                                                  message_matrix.size())
 
         msg_llrs = (msg_sum + llr_vec).to(torch.float)
-        dec_word = torch.signbit(msg_llrs)
+        dec_word = msg_llrs < 0 #torch.signbit(msg_llrs)
 
     return out_word.to(torch.float), out_llrs.to(torch.float32), iterations
 
@@ -245,24 +263,30 @@ class LDPC:
         params = get_ldpc_code_params(header_fn, compute_matrix=True)
         params['decode_algorithm'] = 'SPA'
         return params
-
+    
     def zero_pad(self, x, modulo):
-        B, L = message_bits.size()
-        padded_message = self.zero_pad(message_bits, self.k)
-        padded_message = padded_message.view(B, self.k)
-        parity = torch.matmul(padded_message, self.G) % 2
-        codeword = torch.cat((padded_message, parity), dim=-1)
-        return codeword
+        B, _, L = x.size()
+        if torch.numel(x[0]) % modulo != 0:
+            n_pad = (modulo*L) - (torch.numel(x[0]) % (modulo*L))
+            zero_pad = torch.zeros(B, n_pad, device=x.device).view(B, -1, L)
+            padded_message = torch.cat((x, zero_pad), dim=1)
+        else:
+            padded_message = x
+        return padded_message
+    
+   
 
     def encode(self, message_bits):
-        B, L = message_bits.size()
+        N = 1
+        B, N, L = message_bits.size()
         padded_message = self.zero_pad(message_bits, self.k)
-        padded_message = padded_message.view(B, self.k)
+        padded_message = padded_message.view(B, -1, self.k)
         parity = torch.matmul(padded_message, self.G) % 2
         codeword = torch.cat((padded_message, parity), dim=-1)
         return codeword
 
     def decode(self, symbol_llr):
+        #print(f"llr size: {symbol_llr.shape}")
         # NOTE process batch by batch due to memory use
         batch_llr = torch.chunk(symbol_llr, chunks=1, dim=0)
         out_llr = []
